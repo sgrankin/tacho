@@ -1,5 +1,5 @@
 use super::Report;
-use hdrsample::Histogram;
+use hdrhistogram::Histogram;
 use std::fmt;
 use std::sync::Arc;
 
@@ -40,12 +40,7 @@ where
     Ok(())
 }
 
-fn write_buckets<N, W>(
-    out: &mut W,
-    name: &N,
-    labels: &FmtLabels,
-    h: &Histogram<usize>,
-) -> fmt::Result
+fn write_buckets<N, W>(out: &mut W, name: &N, labels: &FmtLabels, h: &Histogram<u64>) -> fmt::Result
 where
     N: fmt::Display,
     W: fmt::Write,
@@ -55,11 +50,11 @@ where
     //
     // XXX Currently, we use the highest-granularity histogram available. This probably
     // isn't practical.
-    let mut accum = 0;
-    let mut count = 0;
+    let mut accum = 0u64;
+    let mut count = 0u64;
     for bucket in h.iter_recorded() {
         if count > 0 {
-            write_bucket(out, name, labels, &(bucket.value() - 1), accum)?;
+            write_bucket(out, name, labels, &(bucket.value_iterated_to() - 1), accum)?;
         }
         count = bucket.count_at_value();
         accum += count;
@@ -80,7 +75,7 @@ fn write_bucket<N, M, W>(
     name: &N,
     labels: &FmtLabels,
     le: &M,
-    count: usize,
+    count: u64,
 ) -> fmt::Result
 where
     N: fmt::Display,

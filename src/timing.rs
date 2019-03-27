@@ -1,11 +1,11 @@
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 pub trait Timing {
     fn elapsed_us(&self) -> u64;
     fn elapsed_ms(&self) -> u64;
 }
 
-impl Timing {
+impl dyn Timing {
     pub fn start() -> Instant {
         Instant::now()
     }

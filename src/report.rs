@@ -1,11 +1,11 @@
-use super::{Key, HistogramWithSum, Registry, CounterMap, GaugeMap, StatMap};
-use ordermap::OrderMap;
-use std::sync::{Arc, Mutex};
+use super::{CounterMap, GaugeMap, HistogramWithSum, Key, Registry, StatMap};
+use indexmap::IndexMap;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
-type ReportCounterMap = OrderMap<Key, usize>;
-type ReportGaugeMap = OrderMap<Key, usize>;
-type ReportStatMap = OrderMap<Key, HistogramWithSum>;
+type ReportCounterMap = IndexMap<Key, usize>;
+type ReportGaugeMap = IndexMap<Key, usize>;
+type ReportStatMap = IndexMap<Key, HistogramWithSum>;
 
 pub fn new(registry: Arc<Mutex<Registry>>) -> Reporter {
     Reporter(registry)

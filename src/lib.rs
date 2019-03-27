@@ -12,38 +12,40 @@
 //! Labels are stored in a `BTreeMap` because they are used as hash keys and, therefore,
 //! need to implement `Hash`.
 
-
-#![cfg_attr(test, feature(test))]
+//#![cfg_attr(test, feature(test))]
 
 extern crate futures;
-extern crate hdrsample;
+extern crate hdrhistogram;
 #[macro_use]
 extern crate log;
-extern crate ordermap;
-#[cfg(test)]
-extern crate test;
+extern crate indexmap;
+// #[cfg(test)]
+// extern crate test;
 
-use futures::{Future, Poll};
-use hdrsample::Histogram;
-use ordermap::OrderMap;
-use std::boxed::Box;
+use futures::future::FutureExt;
+use futures::task::Poll;
+use hdrhistogram::Histogram;
+use indexmap::IndexMap;
+use pin_project::pin_project;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, Weak};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 pub mod prometheus;
 mod report;
 mod timing;
 
-pub use report::{Reporter, Report};
+pub use report::{Report, Reporter};
 pub use timing::Timing;
 
 type Labels = BTreeMap<&'static str, String>;
-type CounterMap = OrderMap<Key, Arc<AtomicUsize>>;
-type GaugeMap = OrderMap<Key, Arc<AtomicUsize>>;
-type StatMap = OrderMap<Key, Arc<Mutex<HistogramWithSum>>>;
+type CounterMap = IndexMap<Key, Arc<AtomicUsize>>;
+type GaugeMap = IndexMap<Key, Arc<AtomicUsize>>;
+type StatMap = IndexMap<Key, Arc<Mutex<HistogramWithSum>>>;
 
 #[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Prefix {
@@ -53,7 +55,6 @@ pub enum Prefix {
         value: &'static str,
     },
 }
-
 
 /// Creates a metrics registry.
 ///
@@ -145,9 +146,10 @@ impl Scope {
     /// Creates a Counter with the given name.
     pub fn counter(&self, name: &'static str) -> Counter {
         let key = Key::new(name, self.prefix.clone(), self.labels.clone());
-        let mut reg = self.registry.lock().expect(
-            "failed to obtain lock on registry",
-        );
+        let mut reg = self
+            .registry
+            .lock()
+            .expect("failed to obtain lock on registry");
 
         if let Some(c) = reg.counters.get(&key) {
             return Counter(Arc::downgrade(c));
@@ -162,9 +164,10 @@ impl Scope {
     /// Creates a Gauge with the given name.
     pub fn gauge(&self, name: &'static str) -> Gauge {
         let key = Key::new(name, self.prefix.clone(), self.labels.clone());
-        let mut reg = self.registry.lock().expect(
-            "failed to obtain lock on registry",
-        );
+        let mut reg = self
+            .registry
+            .lock()
+            .expect("failed to obtain lock on registry");
 
         if let Some(g) = reg.gauges.get(&key) {
             return Gauge(Arc::downgrade(g));
@@ -205,9 +208,10 @@ impl Scope {
     }
 
     fn mk_stat(&self, key: Key, bounds: Option<(u64, u64)>) -> Stat {
-        let mut reg = self.registry.lock().expect(
-            "failed to obtain lock on registry",
-        );
+        let mut reg = self
+            .registry
+            .lock()
+            .expect("failed to obtain lock on registry");
 
         if let Some(h) = reg.stats.get(&key) {
             let histo = Arc::downgrade(h);
@@ -260,15 +264,15 @@ impl Gauge {
 }
 
 /// Histograms hold up to 4 significant figures.
-const HISTOGRAM_PRECISION: u32 = 4;
+const HISTOGRAM_PRECISION: u8 = 4;
 
 /// Tracks a distribution of values with their sum.
 ///
-/// `hdrsample::Histogram` does not track a sum by default; but prometheus expects a `sum`
+/// `hdrhistogram::Histogram` does not track a sum by default; but prometheus expects a `sum`
 /// for histograms.
 #[derive(Clone)]
 pub struct HistogramWithSum {
-    histogram: Histogram<usize>,
+    histogram: Histogram<u64>,
     sum: u64,
 }
 
@@ -276,8 +280,8 @@ impl HistogramWithSum {
     /// Constructs a new `HistogramWithSum`, possibly with bounds.
     fn new(bounds: Option<(u64, u64)>) -> Self {
         let h = match bounds {
-            None => Histogram::<usize>::new(HISTOGRAM_PRECISION),
-            Some((l, h)) => Histogram::<usize>::new_with_bounds(l, h, HISTOGRAM_PRECISION),
+            None => Histogram::<u64>::new(HISTOGRAM_PRECISION),
+            Some((l, h)) => Histogram::<u64>::new_with_bounds(l, h, HISTOGRAM_PRECISION),
         };
         let histogram = h.expect("failed to create histogram");
         HistogramWithSum { histogram, sum: 0 }
@@ -295,11 +299,11 @@ impl HistogramWithSum {
         }
     }
 
-    pub fn histogram(&self) -> &Histogram<usize> {
+    pub fn histogram(&self) -> &Histogram<u64> {
         &self.histogram
     }
     pub fn count(&self) -> u64 {
-        self.histogram.count()
+        self.histogram.len()
     }
     pub fn max(&self) -> u64 {
         self.histogram.max()
@@ -357,22 +361,21 @@ impl Timer {
         self.stat.add(to_u64(t0, self.unit));
     }
 
-    pub fn time<F>(&self, fut: F) -> Timed<F>
-    where
-        F: Future + 'static,
-    {
+    pub fn time<F: Future>(&self, fut: F) -> Timed<impl Future<Output = F::Output>> {
         let stat = self.stat.clone();
         let unit = self.unit;
-        let f = futures::lazy(move || {
+        let f = futures::future::lazy(|_| {
             // Start timing once the future is actually being invoked (and not
             // when the object is created).
-            let t0 = Timing::start();
-            fut.then(move |v| {
+            Timing::start()
+        })
+        .then(move |t0| {
+            fut.map(move |v| {
                 stat.add(to_u64(t0, unit));
                 v
             })
         });
-        Timed(Box::new(f))
+        Timed(f)
     }
 }
 
@@ -383,167 +386,193 @@ fn to_u64(t0: Instant, unit: TimeUnit) -> u64 {
     }
 }
 
-pub struct Timed<F: Future>(Box<Future<Item = F::Item, Error = F::Error>>);
+#[pin_project]
+pub struct Timed<F>(#[pin] F);
 impl<F: Future> Future for Timed<F> {
-    type Item = F::Item;
-    type Error = F::Error;
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.0.poll()
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut futures::task::Context) -> Poll<Self::Output> {
+        self.project().0.poll(cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use test::Bencher;
+    // use super::*;
+    // use test::Bencher;
+    // static DEFAULT_METRIC_NAME: &'static str = "a_sufficiently_long_name";
+    // #[bench]
+    // fn bench_scope_clone(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     b.iter(move || {
+    //         let _ = metrics.clone();
+    //     });
+    // }
 
-    static DEFAULT_METRIC_NAME: &'static str = "a_sufficiently_long_name";
+    // #[bench]
+    // fn bench_scope_label(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     b.iter(move || {
+    //         let _ = metrics.clone().labeled("foo", "bar");
+    //     });
+    // }
 
-    #[bench]
-    fn bench_scope_clone(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        b.iter(move || { let _ = metrics.clone(); });
-    }
+    // #[bench]
+    // fn bench_scope_clone_x1000(b: &mut Bencher) {
+    //     let scopes = mk_scopes(1000, "bench_scope_clone_x1000");
+    //     b.iter(move || {
+    //         for scope in &scopes {
+    //             let _ = scope.clone();
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_scope_label(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        b.iter(move || { let _ = metrics.clone().labeled("foo", "bar"); });
-    }
+    // #[bench]
+    // fn bench_scope_label_x1000(b: &mut Bencher) {
+    //     let scopes = mk_scopes(1000, "bench_scope_label_x1000");
+    //     b.iter(move || {
+    //         for scope in &scopes {
+    //             let _ = scope.clone().labeled("foo", "bar");
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_scope_clone_x1000(b: &mut Bencher) {
-        let scopes = mk_scopes(1000, "bench_scope_clone_x1000");
-        b.iter(move || for scope in &scopes {
-            let _ = scope.clone();
-        });
-    }
+    // #[bench]
+    // fn bench_counter_create(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     b.iter(move || {
+    //         let _ = metrics.counter(DEFAULT_METRIC_NAME);
+    //     });
+    // }
 
-    #[bench]
-    fn bench_scope_label_x1000(b: &mut Bencher) {
-        let scopes = mk_scopes(1000, "bench_scope_label_x1000");
-        b.iter(move || for scope in &scopes {
-            let _ = scope.clone().labeled("foo", "bar");
-        });
-    }
+    // #[bench]
+    // fn bench_gauge_create(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     b.iter(move || {
+    //         let _ = metrics.gauge(DEFAULT_METRIC_NAME);
+    //     });
+    // }
 
-    #[bench]
-    fn bench_counter_create(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        b.iter(move || { let _ = metrics.counter(DEFAULT_METRIC_NAME); });
-    }
+    // #[bench]
+    // fn bench_stat_create(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     b.iter(move || {
+    //         let _ = metrics.stat(DEFAULT_METRIC_NAME);
+    //     });
+    // }
 
-    #[bench]
-    fn bench_gauge_create(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        b.iter(move || { let _ = metrics.gauge(DEFAULT_METRIC_NAME); });
-    }
+    // #[bench]
+    // fn bench_counter_create_x1000(b: &mut Bencher) {
+    //     let scopes = mk_scopes(1000, "bench_counter_create_x1000");
+    //     b.iter(move || {
+    //         for scope in &scopes {
+    //             scope.counter(DEFAULT_METRIC_NAME);
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_stat_create(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        b.iter(move || { let _ = metrics.stat(DEFAULT_METRIC_NAME); });
-    }
+    // #[bench]
+    // fn bench_gauge_create_x1000(b: &mut Bencher) {
+    //     let scopes = mk_scopes(1000, "bench_gauge_create_x1000");
+    //     b.iter(move || {
+    //         for scope in &scopes {
+    //             scope.gauge(DEFAULT_METRIC_NAME);
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_counter_create_x1000(b: &mut Bencher) {
-        let scopes = mk_scopes(1000, "bench_counter_create_x1000");
-        b.iter(move || for scope in &scopes {
-            scope.counter(DEFAULT_METRIC_NAME);
-        });
-    }
+    // #[bench]
+    // fn bench_stat_create_x1000(b: &mut Bencher) {
+    //     let scopes = mk_scopes(1000, "bench_stat_create_x1000");
+    //     b.iter(move || {
+    //         for scope in &scopes {
+    //             scope.stat(DEFAULT_METRIC_NAME);
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_gauge_create_x1000(b: &mut Bencher) {
-        let scopes = mk_scopes(1000, "bench_gauge_create_x1000");
-        b.iter(move || for scope in &scopes {
-            scope.gauge(DEFAULT_METRIC_NAME);
-        });
-    }
+    // #[bench]
+    // fn bench_counter_update(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     let c = metrics.counter(DEFAULT_METRIC_NAME);
+    //     b.iter(move || c.incr(1));
+    // }
 
-    #[bench]
-    fn bench_stat_create_x1000(b: &mut Bencher) {
-        let scopes = mk_scopes(1000, "bench_stat_create_x1000");
-        b.iter(move || for scope in &scopes {
-            scope.stat(DEFAULT_METRIC_NAME);
-        });
-    }
+    // #[bench]
+    // fn bench_gauge_update(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     let g = metrics.gauge(DEFAULT_METRIC_NAME);
+    //     b.iter(move || g.set(1));
+    // }
 
-    #[bench]
-    fn bench_counter_update(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        let c = metrics.counter(DEFAULT_METRIC_NAME);
-        b.iter(move || c.incr(1));
-    }
+    // #[bench]
+    // fn bench_stat_update(b: &mut Bencher) {
+    //     let (metrics, _) = super::new();
+    //     let s = metrics.stat(DEFAULT_METRIC_NAME);
+    //     b.iter(move || s.add(1));
+    // }
 
-    #[bench]
-    fn bench_gauge_update(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        let g = metrics.gauge(DEFAULT_METRIC_NAME);
-        b.iter(move || g.set(1));
-    }
+    // #[bench]
+    // fn bench_counter_update_x1000(b: &mut Bencher) {
+    //     let counters: Vec<Counter> = mk_scopes(1000, "bench_counter_update_x1000")
+    //         .iter()
+    //         .map(|s| s.counter(DEFAULT_METRIC_NAME))
+    //         .collect();
+    //     b.iter(move || {
+    //         for c in &counters {
+    //             c.incr(1)
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_stat_update(b: &mut Bencher) {
-        let (metrics, _) = super::new();
-        let s = metrics.stat(DEFAULT_METRIC_NAME);
-        b.iter(move || s.add(1));
-    }
+    // #[bench]
+    // fn bench_gauge_update_x1000(b: &mut Bencher) {
+    //     let gauges: Vec<Gauge> = mk_scopes(1000, "bench_gauge_update_x1000")
+    //         .iter()
+    //         .map(|s| s.gauge(DEFAULT_METRIC_NAME))
+    //         .collect();
+    //     b.iter(move || {
+    //         for g in &gauges {
+    //             g.set(1)
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_counter_update_x1000(b: &mut Bencher) {
-        let counters: Vec<Counter> = mk_scopes(1000, "bench_counter_update_x1000")
-            .iter()
-            .map(|s| s.counter(DEFAULT_METRIC_NAME))
-            .collect();
-        b.iter(move || for c in &counters {
-            c.incr(1)
-        });
-    }
+    // #[bench]
+    // fn bench_stat_update_x1000(b: &mut Bencher) {
+    //     let stats: Vec<Stat> = mk_scopes(1000, "bench_stat_update_x1000")
+    //         .iter()
+    //         .map(|s| s.stat(DEFAULT_METRIC_NAME))
+    //         .collect();
+    //     b.iter(move || {
+    //         for s in &stats {
+    //             s.add(1)
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_gauge_update_x1000(b: &mut Bencher) {
-        let gauges: Vec<Gauge> = mk_scopes(1000, "bench_gauge_update_x1000")
-            .iter()
-            .map(|s| s.gauge(DEFAULT_METRIC_NAME))
-            .collect();
-        b.iter(move || for g in &gauges {
-            g.set(1)
-        });
-    }
+    // #[bench]
+    // fn bench_stat_add_x1000(b: &mut Bencher) {
+    //     let s = {
+    //         let (metrics, _) = super::new();
+    //         metrics.stat(DEFAULT_METRIC_NAME)
+    //     };
+    //     b.iter(move || {
+    //         for i in 0..1000 {
+    //             s.add(i)
+    //         }
+    //     });
+    // }
 
-    #[bench]
-    fn bench_stat_update_x1000(b: &mut Bencher) {
-        let stats: Vec<Stat> = mk_scopes(1000, "bench_stat_update_x1000")
-            .iter()
-            .map(|s| s.stat(DEFAULT_METRIC_NAME))
-            .collect();
-        b.iter(move || for s in &stats {
-            s.add(1)
-        });
-    }
-
-    #[bench]
-    fn bench_stat_add_x1000(b: &mut Bencher) {
-        let s = {
-            let (metrics, _) = super::new();
-            metrics.stat(DEFAULT_METRIC_NAME)
-        };
-        b.iter(move || for i in 0..1000 {
-            s.add(i)
-        });
-    }
-
-    fn mk_scopes(n: usize, name: &str) -> Vec<Scope> {
-        let (metrics, _) = super::new();
-        let metrics = metrics.prefixed("t").labeled("test_name", name).labeled(
-            "total_iterations",
-            n,
-        );
-        (0..n)
-            .map(|i| metrics.clone().labeled("iteration", format!("{}", i)))
-            .collect()
-    }
+    // fn mk_scopes(n: usize, name: &str) -> Vec<Scope> {
+    //     let (metrics, _) = super::new();
+    //     let metrics = metrics
+    //         .prefixed("t")
+    //         .labeled("test_name", name)
+    //         .labeled("total_iterations", n);
+    //     (0..n)
+    //         .map(|i| metrics.clone().labeled("iteration", format!("{}", i)))
+    //         .collect()
+    // }
 
     #[test]
     fn test_report_peek() {
@@ -567,7 +596,7 @@ mod tests {
                     .find(|k| k.name() == "happy_accidents")
                     .expect("expected counter: happy_accidents");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.counters().get(&k), Some(&1));
+                assert_eq!(report.counters().get(k), Some(&1));
             }
             {
                 let k = report
@@ -576,7 +605,7 @@ mod tests {
                     .find(|k| k.name() == "paint_level")
                     .expect("expected gauge: paint_level");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.gauges().get(&k), Some(&2));
+                assert_eq!(report.gauges().get(k), Some(&2));
             }
             assert_eq!(
                 report.gauges().keys().find(|k| k.name() == "brush_width"),
@@ -589,7 +618,7 @@ mod tests {
                     .find(|k| k.name() == "stroke_len")
                     .expect("expected stat: stroke_len");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
             assert_eq!(report.stats().keys().find(|k| k.name() == "tree_len"), None);
         }
@@ -612,7 +641,7 @@ mod tests {
                     .find(|k| k.name() == "happy_accidents")
                     .expect("expected counter: happy_accidents");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.counters().get(&k), Some(&3));
+                assert_eq!(report.counters().get(k), Some(&3));
             }
             {
                 let k = report
@@ -621,7 +650,7 @@ mod tests {
                     .find(|k| k.name() == "paint_level")
                     .expect("expected gauge: paint_level");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.gauges().get(&k), Some(&2));
+                assert_eq!(report.gauges().get(k), Some(&2));
             }
             {
                 let k = report
@@ -630,7 +659,7 @@ mod tests {
                     .find(|k| k.name() == "brush_width")
                     .expect("expected gauge: brush_width");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.gauges().get(&k), Some(&5));
+                assert_eq!(report.gauges().get(k), Some(&5));
             }
             {
                 let k = report
@@ -639,7 +668,7 @@ mod tests {
                     .find(|k| k.name() == "stroke_len")
                     .expect("expected stat: stroke_len");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
             {
                 let k = report
@@ -648,7 +677,7 @@ mod tests {
                     .find(|k| k.name() == "tree_len")
                     .expect("expected stat: tree_len");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
         }
     }
@@ -673,7 +702,7 @@ mod tests {
                     .find(|k| k.name() == "happy_accidents")
                     .expect("expected counter: happy_accidents");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.counters().get(&k), Some(&1));
+                assert_eq!(report.counters().get(k), Some(&1));
             }
             {
                 let k = report
@@ -682,7 +711,7 @@ mod tests {
                     .find(|k| k.name() == "paint_level")
                     .expect("expected gauge");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.gauges().get(&k), Some(&2));
+                assert_eq!(report.gauges().get(k), Some(&2));
             }
             assert_eq!(
                 report.gauges().keys().find(|k| k.name() == "brush_width"),
@@ -695,7 +724,7 @@ mod tests {
                     .find(|k| k.name() == "stroke_len")
                     .expect("expected stat");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
             assert_eq!(report.stats().keys().find(|k| k.name() == "tree_len"), None);
             {
@@ -705,7 +734,7 @@ mod tests {
                     .find(|k| k.name() == "stroke_len")
                     .expect("expected stat");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
         }
 
@@ -720,7 +749,7 @@ mod tests {
                     .find(|k| k.name() == "happy_accidents")
                     .expect("expected counter: happy_accidents");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(counters.get(&k), Some(&1));
+                assert_eq!(counters.get(k), Some(&1));
             }
             {
                 let k = report
@@ -729,7 +758,7 @@ mod tests {
                     .find(|k| k.name() == "paint_level")
                     .expect("expected gauge");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.gauges().get(&k), Some(&2));
+                assert_eq!(report.gauges().get(k), Some(&2));
             }
             {
                 let k = report
@@ -738,7 +767,7 @@ mod tests {
                     .find(|k| k.name() == "stroke_len")
                     .expect("expected stat");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
         }
 
@@ -756,7 +785,7 @@ mod tests {
                     .find(|k| k.name() == "happy_accidents")
                     .expect("expected counter: happy_accidents");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.counters().get(&k), Some(&3));
+                assert_eq!(report.counters().get(k), Some(&3));
             }
             assert_eq!(
                 report.gauges().keys().find(|k| k.name() == "paint_level"),
@@ -769,7 +798,7 @@ mod tests {
                     .find(|k| k.name() == "brush_width")
                     .expect("expected gauge");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert_eq!(report.gauges().get(&k), Some(&5));
+                assert_eq!(report.gauges().get(k), Some(&5));
             }
             assert_eq!(
                 report.stats().keys().find(|k| k.name() == "stroke_len"),
@@ -782,7 +811,7 @@ mod tests {
                     .find(|k| k.name() == "tree_len")
                     .expect("expeced stat");
                 assert_eq!(k.labels.get("joy"), Some(&"painting".to_string()));
-                assert!(report.stats().contains_key(&k));
+                assert!(report.stats().contains_key(k));
             }
         }
     }

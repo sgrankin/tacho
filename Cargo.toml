@@ -1,20 +1,26 @@
 [package]
-name = "tacho"
+authors = [
+  "Steve Jenson <stevej@buoyant.io>",
+  "Oliver Gould <oliver@buoyant.io>",
+]
 description = "A prometheus-focused metrics library for Future-aware applications"
-version = "0.4.2"
-authors = ["Steve Jenson <stevej@buoyant.io>",
-           "Oliver Gould <oliver@buoyant.io>"]
-repository = "https://github.com/BuoyantIO/tacho"
+edition = "2018"
 license = "Apache-2.0"
+name = "sgrankin-tacho"
 readme = "README.md"
+repository = "https://github.com/sgrankin/tacho"
+version = "0.5.0"
+
+[lib]
+name = "tacho"
 
 [dependencies]
-futures = "0.1"
-hdrsample = "3.0"
-log = "0.3"
-ordermap = "0.2.10"
+futures = "0.3.5"
+hdrhistogram = "7.1.0"
+indexmap = "1.5.2"
+log = "0.4.11"
+pin-project = "0.4.23"
 
 [dev-dependencies]
-tokio-timer = "0.1"
-tokio-core = "0.1"
-pretty_env_logger = "0.1"
+pretty_env_logger = "0.4.0"
+tokio = { version = "0.2.22", features = ["time", "stream"] }

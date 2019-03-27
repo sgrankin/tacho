@@ -2,21 +2,17 @@
 
 #[macro_use]
 extern crate log;
-extern crate pretty_env_logger;
-extern crate futures;
-extern crate tacho;
-extern crate tokio_core;
-extern crate tokio_timer;
 
-use futures::{BoxFuture, Future, Stream};
-use futures::sync::oneshot;
+use futures::channel::oneshot;
+use futures::future;
+use futures::stream::StreamExt;
+use futures::Future;
+use futures::FutureExt;
 use std::thread;
 use std::time::Duration;
 use tacho::Timing;
-use tokio_core::reactor::Core;
-use tokio_timer::Timer;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(pretty_env_logger::init());
 
     let (metrics, report) = tacho::new();
@@ -24,9 +20,7 @@ fn main() {
     let (work_done_tx0, work_done_rx0) = oneshot::channel();
     let (work_done_tx1, work_done_rx1) = oneshot::channel();
     let reporter = {
-        let work_done_rx = work_done_rx0.join(work_done_rx1).map(|_| {}).map_err(
-            |_| (),
-        );
+        let work_done_rx = future::join(work_done_rx0, work_done_rx1).map(|_| {});
         let interval = Duration::from_secs(2);
         reporter(interval, work_done_rx, report)
     };
@@ -56,28 +50,33 @@ fn main() {
             work_done_tx.send(()).expect("could not send");
         });
     }
-
-    let mut core = Core::new().expect("Failed to create core");
-    core.run(reporter).expect("failed to run reporter");
+    tokio::runtime::Runtime::new()?.block_on(reporter);
+    Ok(())
 }
 
 /// Prints a report every `interval` and when the `done` is satisfied.
-fn reporter<D>(interval: Duration, done: D, reporter: tacho::Reporter) -> BoxFuture<(), ()>
+fn reporter<D>(
+    interval: Duration,
+    done: D,
+    reporter: tacho::Reporter,
+) -> impl Future<Output = ()> + Send
 where
-    D: Future<Item = (), Error = ()> + Send + 'static,
+    D: Future<Output = ()> + Send + 'static,
 {
     let periodic = {
         let mut reporter = reporter.clone();
-        Timer::default()
-            .interval(interval)
-            .map_err(|_| {})
-            .for_each(move |_| {
-                print_report(&reporter.take());
-                Ok(())
-            })
+        tokio::time::interval(interval).map(move |_| {
+            print_report(&reporter.take());
+            future::ready(())
+        })
     };
-    let done = done.map(move |_| { print_report(&reporter.peek()); });
-    periodic.select(done).map(|_| {}).map_err(|_| {}).boxed()
+    let done = done.map(move |_| {
+        print_report(&reporter.peek());
+    });
+    periodic
+        .take_until(done)
+        .map(|_| ())
+        .fold((), |_, _| future::ready(()))
 }
 
 fn print_report(report: &tacho::Report) {
