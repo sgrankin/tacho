@@ -22,5 +22,10 @@ log = "0.4.11"
 pin-project = "0.4.23"
 
 [dev-dependencies]
+criterion = "0.3.3"
 pretty_env_logger = "0.4.0"
-tokio = { version = "0.2.22", features = ["time", "stream"] }
+tokio = {version = "0.2.22", features = ["time", "stream"]}
+
+[[bench]]
+harness = false
+name = "bench"
