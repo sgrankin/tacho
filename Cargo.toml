@@ -3,13 +3,13 @@ authors = [
   "Steve Jenson <stevej@buoyant.io>",
   "Oliver Gould <oliver@buoyant.io>",
 ]
-description = "A prometheus-focused metrics library for Future-aware applications"
+description = "tacho fork with updates -- A prometheus-focused metrics library for Future-aware applications]"
 edition = "2018"
 license = "Apache-2.0"
 name = "sgrankin-tacho"
 readme = "README.md"
 repository = "https://github.com/sgrankin/tacho"
-version = "0.5.0"
+version = "0.5.1"
 
 [lib]
 name = "tacho"

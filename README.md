@@ -1,4 +1,6 @@
-# Tacho #
+››› This is an unofficial fork with some updates. ‹‹‹
+
+# Tacho
 
 A [Prometheus][prom]-focused metrics library for [Future-aware][futures-rs] Rust applications.
 
@@ -8,7 +10,7 @@ A [Prometheus][prom]-focused metrics library for [Future-aware][futures-rs] Rust
 - Future-aware timing histograms.
 - Thread-safe.
 
-## License ##
+## License
 
 Copyright 2017, Buoyant Inc. All rights reserved.
 
